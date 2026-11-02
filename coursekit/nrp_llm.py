@@ -14,6 +14,7 @@ Token    : https://nrp.ai/llmtoken  ->  export NRP_API_KEY=...
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Iterable
 
 from openai import OpenAI
@@ -29,19 +30,13 @@ class MissingKey(RuntimeError):
     """Raised with instructions rather than a bare KeyError."""
 
 
-ENV_FILE = os.path.expanduser("~/doc/genai_appsAI_Lab/.env")
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 
 def _from_env_file(name: str) -> str | None:
-    """Read one KEY=value out of ~/persistent/.env.
-
-    The workspace writes the key there and sources it from ~/.bashrc, so a
-    login shell already has it. A Streamlit app started from the Coder app
-    button, or a Jupyter kernel started by VS Code, may not go through
-    .bashrc at all -- so read the file directly rather than assuming.
-    """
+    """Read one KEY=value from the project .env, independent of launch directory."""
     try:
-        with open(ENV_FILE) as fh:
+        with open(ENV_FILE, encoding="utf-8-sig") as fh:
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -55,7 +50,7 @@ def _from_env_file(name: str) -> str | None:
 
 
 def _api_key() -> str:
-    """Resolve the key, preferring ~/persistent/.env over the environment.
+    """Resolve the key, preferring the project .env over the environment.
 
     The file is checked FIRST on purpose. A process inherits its environment
     once, at start, so a Streamlit app or Jupyter kernel launched at workspace
