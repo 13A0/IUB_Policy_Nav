@@ -11,19 +11,20 @@ the OpenAI, Together, Groq or vLLM clients.
 Endpoint : https://ellm.nrp-nautilus.io/v1
 Token    : https://nrp.ai/llmtoken  ->  export NRP_API_KEY=...
 """
+
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 from openai import OpenAI
 
 BASE_URL = "https://ellm.nrp-nautilus.io/v1"
 
 # Sensible defaults for coursework. Override per call when a lab asks you to.
-CHAT_MODEL = "gpt-oss"              # fast, reliable, 131K context
-EMBED_MODEL = "qwen3-embedding"     # embeddings only — never call it for chat
+CHAT_MODEL = "gpt-oss"  # fast, reliable, 131K context
+EMBED_MODEL = "qwen3-embedding"  # embeddings only — never call it for chat
 
 
 class MissingKey(RuntimeError):
@@ -62,10 +63,12 @@ def _api_key() -> str:
     next request, with no restart and no new terminal. The environment stays
     as a fallback for anyone who deliberately exports a key.
     """
-    key = (_from_env_file("OPENAI_API_KEY")
-           or _from_env_file("NRP_API_KEY")
-           or os.environ.get("NRP_API_KEY")
-           or os.environ.get("OPENAI_API_KEY"))
+    key = (
+        _from_env_file("OPENAI_API_KEY")
+        or _from_env_file("NRP_API_KEY")
+        or os.environ.get("NRP_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+    )
     if not key:
         raise MissingKey(
             "No API key found.\n"
@@ -84,22 +87,31 @@ TIMEOUT = 60.0
 
 def client() -> OpenAI:
     """An OpenAI client pointed at NRP."""
-    return OpenAI(api_key=_api_key(), base_url=BASE_URL, timeout=TIMEOUT)
+    return OpenAI(api_key=_api_key(), base_url=BASE_URL, timeout=TIMEOUT, max_retries=0)
 
 
-def chat(prompt: str, *, system: str | None = None, model: str = CHAT_MODEL,
-         temperature: float = 0.7, **kw) -> str:
+def chat(
+    prompt: str,
+    *,
+    system: str | None = None,
+    model: str = CHAT_MODEL,
+    temperature: float = 0.7,
+    **kw,
+) -> str:
     """One-shot prompt in, string out. The 90% case for these labs."""
-    messages = ([{"role": "system", "content": system}] if system else [])
+    messages = [{"role": "system", "content": system}] if system else []
     messages.append({"role": "user", "content": prompt})
-    resp = client().chat.completions.create(
-        model=model, messages=messages, temperature=temperature, **kw)
+    with client() as api:
+        resp = api.chat.completions.create(
+            model=model, messages=messages, temperature=temperature, **kw
+        )
     return resp.choices[0].message.content
 
 
 def converse(messages: list[dict], *, model: str = CHAT_MODEL, **kw) -> str:
     """Full message list in, string out — use once you need multi-turn memory."""
-    resp = client().chat.completions.create(model=model, messages=messages, **kw)
+    with client() as api:
+        resp = api.chat.completions.create(model=model, messages=messages, **kw)
     return resp.choices[0].message.content
 
 
@@ -108,13 +120,22 @@ def embed(texts: str | Iterable[str], *, model: str = EMBED_MODEL) -> list[list[
     if isinstance(texts, str):
         texts = [texts]
     texts = list(texts)
-    resp = client().embeddings.create(model=model, input=texts)
-    return [d.embedding for d in resp.data]
+    if not texts:
+        return []
+    with client() as api:
+        resp = api.embeddings.create(model=model, input=texts)
+    rows = sorted(resp.data, key=lambda item: item.index)
+    if [item.index for item in rows] != list(range(len(texts))):
+        raise ValueError(
+            "The embedding service returned incomplete results. Please try again."
+        )
+    return [item.embedding for item in rows]
 
 
 def models() -> list[str]:
     """Every model id this token may call."""
-    return sorted(m.id for m in client().models.list().data)
+    with client() as api:
+        return sorted(m.id for m in api.models.list().data)
 
 
 if __name__ == "__main__":

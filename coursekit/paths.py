@@ -8,6 +8,7 @@ not find the package. One line at the top of a notebook fixes it:
 
 This module exists for scripts that would rather not hardcode that.
 """
+
 import os
 import sys
 

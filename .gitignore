@@ -1,4 +1,5 @@
 .env
 .venv/
+.venv-backup/
 .chroma/
 __pycache__/

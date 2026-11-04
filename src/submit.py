@@ -1,30 +1,29 @@
 """IUB Student Policy Navigator - simple RAG chatbot.
 
-The app follows the same shape as lab1_rag_chatbot.py:
+Follows lab1_rag_chatbot.py:
 1. embed a small document corpus,
 2. store vectors in Chroma,
 3. embed the student's question,
 4. retrieve the nearest passages,
 5. generate an answer and check it once against those same passages.
 """
+
 from __future__ import annotations
 
-import sys
-import os
-import pathlib
+import hashlib
+import logging
 import re
+import sys
+from pathlib import Path
 
 import chromadb
 import streamlit as st
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-
-UNIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path[:0] = [UNIT, os.path.join(UNIT, "data")]
-
-from coursekit import CHAT_MODEL, MissingKey, chat, embed
-from IUB_policy_corpus import IUB_Policy as DOCUMENTS
+from coursekit import CHAT_MODEL, EMBED_MODEL, MissingKey, chat, embed
+from data.IUB_policy_corpus import IUB_Policy as DOCUMENTS
 
 REFUSAL = (
     "I couldn't find enough information in the available IU policy documents "
@@ -66,68 +65,127 @@ ANSWER_STEPS = """Privately identify passages relevant to each part of the quest
 Return a concise answer with citations and clearly state any evidence gaps.
 """
 
-MODEL = "gpt-oss"
 TOP_K = 5
 TEMPERATURE = 0.2
-COLLECTION = "b490_lab1"
-HISTORY_MESS = 4
-
-st.set_page_config(page_title="IUB Policy Navigator - RAG Chatbot", page_icon="[]")
-st.title("IUB Policy Navigator - RAG Chatbot")
-st.caption(f"Retrieval over {len(DOCUMENTS)} documents, answered by {CHAT_MODEL} on NRP")
+INDEX_BATCH_SIZE = 16
 
 
 @st.cache_resource(show_spinner="Embedding the corpus...")
 def build_index(docs: tuple[str, ...]):
-    store = chromadb.Client()
-    coll = store.get_or_create_collection(COLLECTION)
-    vectors = embed(list(docs))
-    coll.add(
-        ids=[str(i) for i in range(len(docs))],
-        embeddings=vectors,
-        documents=list(docs),
-    )
+    # A new corpus/model gets its own index, so edits cannot reuse stale passages.
+    digest = hashlib.sha256((EMBED_MODEL + "\0" + "\0".join(docs)).encode()).hexdigest()
+    store = chromadb.PersistentClient(path=str(ROOT / ".chroma"))
+    coll = store.get_or_create_collection(f"iub-{digest[:24]}")
+    # Completed batches survive restarts and failed API requests.
+    for start in range(coll.count(), len(docs), INDEX_BATCH_SIZE):
+        batch = list(docs[start : start + INDEX_BATCH_SIZE])
+        coll.upsert(
+            ids=[str(i) for i in range(start, start + len(batch))],
+            embeddings=embed(batch),
+            documents=batch,
+        )
     return coll
 
 
 def retrieve(coll, question: str, k: int = TOP_K) -> list[str]:
+    k = min(k, coll.count())
+    if k <= 0:
+        return []
     hits = coll.query(query_embeddings=embed(question), n_results=k)
     return hits["documents"][0] if hits.get("documents") else []
 
 
-def memory_reply(question: str, history: list[dict]) -> str | None:
-    """Answer common recall requests directly, without retrieval or an LLM."""
+def is_follow_up(question: str) -> bool:
     text = " ".join(re.findall(r"\w+", question.lower()))
-    last_question = (
-        r"(?:what did i (?:just |last |previously )?(?:ask|say)(?: you)?"
-        r"|what was my (?:last|previous|most recent) (?:question|message)"
-        r"|(?:can you )?(?:repeat|remind me of) my (?:last|previous) question)"
-    )
-    if re.fullmatch(last_question, text):
-        previous = next((m for m in reversed(history) if m["role"] == "user"), None)
-        if previous:
-            return f"Your previous message was:\n\n> {previous['content']}"
-        return "You haven't asked an earlier question in this session yet."
-    if text in {"what was my first question", "what did i ask first"}:
-        first = next((m for m in history if m["role"] == "user"), None)
-        if first:
-            return f"Your first message was:\n\n> {first['content']}"
-        return "You haven't asked an earlier question in this session yet."
-    if text in {"what have i asked you", "what questions have i asked", "list my previous questions"}:
-        questions = [m["content"] for m in history if m["role"] == "user"]
-        return "\n\n".join(f"{i}. {q}" for i, q in enumerate(questions, 1)) or (
-            "You haven't asked an earlier question in this session yet."
+    return text in {
+        "why",
+        "how",
+        "explain",
+        "explain more",
+        "tell me more",
+        "can you explain",
+        "can you explain more",
+    } or bool(
+        re.search(
+            r"\b(it|its|that|those|they|them|this|these)\b"
+            r"|^(and|what about|how about)\b",
+            text,
         )
+    )
+
+
+def recall_request(question: str) -> str | None:
+    """Recognize recall wording separately from selecting saved messages."""
+    text = " ".join(re.findall(r"\w+", question.lower()))
+    text = re.sub(r"^(?:please |can you |could you |do you )+", "", text)
+    text = re.sub(r"^(?:remember|recall|remind me)(?: of)? ", "", text)
+    text = re.sub(r" please$", "", text)
+    if re.fullmatch(
+        r"(?:what (?:questions have i asked|have i asked(?: you)?)|list my (?:previous |past )?questions)",
+        text,
+    ):
+        return "all"
+    match = re.fullmatch(
+        r"(?:what (?:was|is) my|repeat my|my) "
+        r"(first|second|third|last|previous|most recent|second to last) (?:question|message)",
+        text,
+    )
+    if match:
+        return match[1]
+    if re.fullmatch(
+        r"what (?:did i (?:just |last |previously )?(?:ask|say|tell)|i (?:asked|said|told))"
+        r"(?: you)?(?: earlier| before| last| last time)?",
+        text,
+    ):
+        return "last"
+    if text == "what did i ask first":
+        return "first"
+    if text in {"what did i ask before that", "what did i ask you before that"}:
+        return "second to last"
     return None
+
+
+def memory_reply(question: str, history: list[dict]) -> str | None:
+    """Recall saved user messages locally; recall requests do not become topics."""
+    request = recall_request(question)
+    if request is None:
+        return None
+    messages = [
+        m["content"]
+        for m in history
+        if m["role"] == "user" and recall_request(m["content"]) is None
+    ]
+    if not messages:
+        return "You haven't asked an earlier question in this session yet."
+    if request == "all":
+        return "\n\n".join(f"{i}. {message}" for i, message in enumerate(messages, 1))
+    position = {"first": 0, "second": 1, "third": 2, "second to last": -2}.get(
+        request, -1
+    )
+    if not -len(messages) <= position < len(messages):
+        return "There aren't enough earlier messages in this session for that request."
+    label = "previous" if position == -1 else request
+    return f"Your {label} message was:\n\n> {messages[position]}"
+
+
+def retrieval_question(question: str, history: list[dict]) -> str:
+    """Keep the original topic through a chain of follow-ups and recall requests."""
+    if not is_follow_up(question):
+        return question
+    topic = []
+    for message in reversed(history):
+        if message["role"] != "user" or recall_request(message["content"]) is not None:
+            continue
+        topic.append(message["content"])
+        if not is_follow_up(message["content"]):
+            break
+    return "\n".join([*reversed(topic), question])
 
 
 def answer(question: str, context: list[str], history: list[dict]) -> str:
     if not context:
         return REFUSAL
-    history_text = "\n".join(
-        f"{m['role']}: {m['content']}"
-        for m in history
-    )
+    history_text = "\n".join(f"{m['role']}: {m['content']}" for m in history)
 
     context_text = "\n\n".join(f"[{i}] {c}" for i, c in enumerate(context, 1))
 
@@ -142,7 +200,7 @@ Current Question:
     draft = chat(
         f"{FEW_SHOT_EXAMPLES}\n\n{ANSWER_STEPS}\n\n{evidence}",
         system=SYSTEM_PROMPT,
-        model=MODEL,
+        model=CHAT_MODEL,
         temperature=TEMPERATURE,
     )
     if not draft or not draft.strip():
@@ -161,7 +219,7 @@ Return ONLY the revised final answer, or the draft unchanged if fully supported.
 Draft to check (not evidence):
 {draft}""",
         system=SYSTEM_PROMPT,
-        model=MODEL,
+        model=CHAT_MODEL,
         temperature=0,
     )
     if not final or not final.strip():
@@ -175,38 +233,55 @@ def show_sources(context: list[str]) -> None:
             st.write(f"[{i}]", passage)
 
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+def main() -> None:
+    st.set_page_config(page_title="IUB Policy Navigator - RAG Chatbot", page_icon="📚")
+    st.title("IUB Policy Navigator - RAG Chatbot")
+    st.caption(
+        f"Retrieval over {len(DOCUMENTS)} documents, answered by {CHAT_MODEL} on NRP"
+    )
 
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
-        if m.get("sources"):
-            show_sources(m["sources"])
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-if prompt := st.chat_input("Ask about IU Bloomington's Policy..."):
-    # Capture prior messages BEFORE saving the current question.
-    history = st.session_state.messages.copy()
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+            if m.get("sources"):
+                show_sources(m["sources"])
 
-    with st.chat_message("assistant"):
-        context = []
-        try:
-            reply = memory_reply(prompt, history)
-            if reply is None:
-                # Build lazily so recall works even when the API is unavailable.
-                collection = build_index(tuple(DOCUMENTS))
-                context = retrieve(collection, prompt)
-                with st.spinner("Checking the policy sources..."):
-                    reply = answer(prompt, context, history[-HISTORY_MESS:])
-        except MissingKey as exc:
-            reply = str(exc)
-        except Exception as exc:
-            # Never display an unchecked draft if retrieval or reflection fails.
-            reply = f"I couldn't complete the policy lookup and grounding check. Please try again. ({exc})"
-        st.markdown(reply)
-        if context:
-            show_sources(context)
-    st.session_state.messages.append({"role": "assistant", "content": reply, "sources": context})
+    if prompt := st.chat_input("Ask about IU Bloomington's Policy..."):
+        prompt = prompt.strip()
+        if not prompt:
+            return
+        # Capture prior messages BEFORE saving the current question.
+        history = st.session_state.messages.copy()
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            context = []
+            try:
+                reply = memory_reply(prompt, history)
+                if reply is None:
+                    # Build lazily so recall works even when the API is unavailable.
+                    collection = build_index(tuple(DOCUMENTS))
+                    context = retrieve(collection, retrieval_question(prompt, history))
+                    with st.spinner("Checking the policy sources..."):
+                        reply = answer(prompt, context, history)
+            except MissingKey as exc:
+                reply = str(exc)
+            except Exception:
+                # Never display an unchecked draft if retrieval or reflection fails.
+                logging.getLogger(__name__).exception("Policy lookup failed")
+                reply = "I couldn't complete the policy lookup and grounding check. Please try again."
+            st.markdown(reply)
+            if context:
+                show_sources(context)
+        st.session_state.messages.append(
+            {"role": "assistant", "content": reply, "sources": context}
+        )
+
+
+if __name__ == "__main__":
+    main()

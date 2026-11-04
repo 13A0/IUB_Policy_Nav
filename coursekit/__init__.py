@@ -4,5 +4,15 @@
 
 One module, one endpoint, one place to change a model name.
 """
-from .nrp_llm import (BASE_URL, CHAT_MODEL, EMBED_MODEL, MissingKey,  # noqa: F401
-                      chat, client, converse, embed, models)
+
+from .nrp_llm import (  # noqa: F401
+    BASE_URL,
+    CHAT_MODEL,
+    EMBED_MODEL,
+    MissingKey,
+    chat,
+    client,
+    converse,
+    embed,
+    models,
+)
